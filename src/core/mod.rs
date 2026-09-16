@@ -11,7 +11,7 @@ pub use browser::BrowserManager;
 pub use config::ChaserConfig;
 
 use crate::error::{ChaserError, ChaserResult};
-use crate::models::{ProxyConfig, WafSession};
+use crate::models::{ProxyConfig, WafSession, WafSessionOptions};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -154,21 +154,31 @@ impl ChaserCF {
     /// # Returns
     ///
     /// A `WafSession` containing cookies and headers that can be used for
-    /// subsequent requests to the same site.
+    /// subsequent requests to the same site. The solve uses a fresh,
+    /// disposable browser context by default.
     pub async fn solve_waf_session(
         &self,
         url: &str,
         proxy: Option<ProxyConfig>,
     ) -> ChaserResult<WafSession> {
+        self.solve_waf_session_with_options(url, proxy, WafSessionOptions::default())
+            .await
+    }
+
+    /// Create a WAF session with per-operation context isolation options.
+    ///
+    /// Use this method to opt out of the default fresh browser context when
+    /// browser state must intentionally be shared with an earlier operation.
+    pub async fn solve_waf_session_with_options(
+        &self,
+        url: &str,
+        proxy: Option<ProxyConfig>,
+        options: WafSessionOptions,
+    ) -> ChaserResult<WafSession> {
         let browser = self.browser().await?;
         let manager = browser.as_ref().ok_or(ChaserError::NotInitialized)?;
 
-        tokio::time::timeout(
-            self.config.timeout(),
-            solver::solve_waf_session(manager, url, proxy),
-        )
-        .await
-        .map_err(|_| ChaserError::Timeout(self.config.timeout_ms))?
+        solver::solve_waf_session(manager, url, proxy, options, self.config.timeout()).await
     }
 
     /// Solve a Turnstile captcha with full page load

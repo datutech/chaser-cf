@@ -38,7 +38,7 @@ Requires Chrome or Chromium installed on the system.
 ### Rust
 
 ```rust
-use chaser_cf::{ChaserCF, ChaserConfig};
+use chaser_cf::{ChaserCF, ChaserConfig, WafSessionOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -65,6 +65,17 @@ async fn main() -> anyhow::Result<()> {
     chaser.shutdown().await;
     Ok(())
 }
+```
+
+WAF solves use a fresh, disposable browser context by default so cookies and
+storage from earlier calls cannot affect the result. To intentionally reuse
+the default browser context:
+
+```rust
+let options = WafSessionOptions::default().with_fresh_context(false);
+let session = chaser
+    .solve_waf_session_with_options("https://example.com", None, options)
+    .await?;
 ```
 
 With proxy:

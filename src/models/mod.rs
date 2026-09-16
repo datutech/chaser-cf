@@ -139,6 +139,36 @@ pub struct WafSession {
     pub headers: HashMap<String, String>,
 }
 
+/// Per-operation options for creating a WAF session.
+///
+/// Fresh browser contexts prevent cookies and other browser storage from a
+/// previous solve from affecting the current result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WafSessionOptions {
+    /// Run the solve in a new, isolated browser context.
+    ///
+    /// Enabled by default. Disable only when intentionally reusing browser
+    /// state between calls. Proxy-backed solves remain isolated because the
+    /// proxy is configured at browser-context scope.
+    pub fresh_context: bool,
+}
+
+impl Default for WafSessionOptions {
+    fn default() -> Self {
+        Self {
+            fresh_context: true,
+        }
+    }
+}
+
+impl WafSessionOptions {
+    /// Configure whether this solve uses a fresh browser context.
+    pub fn with_fresh_context(mut self, enabled: bool) -> Self {
+        self.fresh_context = enabled;
+        self
+    }
+}
+
 impl WafSession {
     /// Create new WAF session
     pub fn new(cookies: Vec<Cookie>, headers: HashMap<String, String>) -> Self {
@@ -260,5 +290,15 @@ mod tests {
         assert_eq!(Profile::parse("LINUX"), Some(Profile::Linux));
         assert_eq!(Profile::parse("darwin"), Some(Profile::Macos));
         assert_eq!(Profile::parse("invalid"), None);
+    }
+
+    #[test]
+    fn waf_session_options_use_fresh_context_by_default() {
+        assert!(WafSessionOptions::default().fresh_context);
+        assert!(
+            !WafSessionOptions::default()
+                .with_fresh_context(false)
+                .fresh_context
+        );
     }
 }

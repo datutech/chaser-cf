@@ -3,7 +3,8 @@
 use crate::error::{ChaserError, ChaserResult};
 use crate::models::ProxyConfig;
 
-use chaser_oxide::cdp::browser_protocol::target::CreateTargetParams;
+use chaser_oxide::cdp::browser_protocol::browser::BrowserContextId;
+use chaser_oxide::cdp::browser_protocol::target::{CreateBrowserContextParams, CreateTargetParams};
 use chaser_oxide::{Browser, BrowserConfig, ChaserPage};
 use futures::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -195,7 +196,8 @@ impl BrowserManager {
     pub async fn create_context(
         &self,
         proxy: Option<&ProxyConfig>,
-    ) -> ChaserResult<Option<chaser_oxide::cdp::browser_protocol::browser::BrowserContextId>> {
+        fresh_context: bool,
+    ) -> ChaserResult<Option<BrowserContextId>> {
         match proxy {
             Some(p) => {
                 let ctx_id = self
@@ -205,8 +207,24 @@ impl BrowserManager {
                     .map_err(|e| ChaserError::ContextFailed(e.to_string()))?;
                 Ok(Some(ctx_id))
             }
+            None if fresh_context => {
+                let ctx_id = self
+                    .browser
+                    .create_browser_context(CreateBrowserContextParams::default())
+                    .await
+                    .map_err(|e| ChaserError::ContextFailed(e.to_string()))?;
+                Ok(Some(ctx_id))
+            }
             None => Ok(None),
         }
+    }
+
+    /// Dispose an isolated browser context and all pages/storage owned by it.
+    pub async fn dispose_context(&self, ctx_id: BrowserContextId) -> ChaserResult<()> {
+        self.browser
+            .dispose_browser_context(ctx_id)
+            .await
+            .map_err(|e| ChaserError::ContextFailed(e.to_string()))
     }
 
     /// Open a blank page, apply the native profile (OS + real Chrome version), then

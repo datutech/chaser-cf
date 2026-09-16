@@ -2,11 +2,12 @@
 
 use super::BrowserManager;
 use crate::error::{ChaserError, ChaserResult};
-use crate::models::{Cookie, ProxyConfig, WafSession};
+use crate::models::{Cookie, ProxyConfig, WafSession, WafSessionOptions};
 
 use chaser_oxide::auth::Credentials;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::time::Instant;
 
 const FAKE_PAGE_HTML: &str = include_str!("../resources/fake_page.html");
 
@@ -17,7 +18,7 @@ pub async fn get_source(
     proxy: Option<ProxyConfig>,
 ) -> ChaserResult<String> {
     let _permit = manager.acquire_permit().await?;
-    let ctx_id = manager.create_context(proxy.as_ref()).await?;
+    let ctx_id = manager.create_context(proxy.as_ref(), false).await?;
     let (page, chaser) = manager.new_page(ctx_id, "about:blank").await?;
 
     setup_proxy_auth(&page, proxy.as_ref()).await?;
@@ -41,50 +42,86 @@ pub async fn solve_waf_session(
     manager: &BrowserManager,
     url: &str,
     proxy: Option<ProxyConfig>,
+    options: WafSessionOptions,
+    operation_timeout: Duration,
 ) -> ChaserResult<WafSession> {
-    let _permit = manager.acquire_permit().await?;
-    let ctx_id = manager.create_context(proxy.as_ref()).await?;
-    let (page, chaser) = manager.new_page(ctx_id, "about:blank").await?;
+    let deadline = Instant::now() + operation_timeout;
+    let timeout_error = || ChaserError::Timeout(operation_timeout.as_millis() as u64);
 
-    setup_proxy_auth(&page, proxy.as_ref()).await?;
-
-    chaser
-        .goto(url)
+    let _permit = tokio::time::timeout_at(deadline, manager.acquire_permit())
         .await
-        .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
+        .map_err(|_| timeout_error())??;
+    let ctx_id = tokio::time::timeout_at(
+        deadline,
+        manager.create_context(proxy.as_ref(), options.fresh_context),
+    )
+    .await
+    .map_err(|_| timeout_error())??;
 
-    wait_for_clearance(&page, &chaser, 90).await;
+    let result = match tokio::time::timeout_at(deadline, async {
+        let (page, chaser) = manager.new_page(ctx_id.clone(), "about:blank").await?;
 
-    let raw_cookies = page
-        .get_cookies()
-        .await
-        .map_err(|e| ChaserError::CookieExtractionFailed(e.to_string()))?;
+        setup_proxy_auth(&page, proxy.as_ref()).await?;
 
-    let cookies: Vec<Cookie> = raw_cookies
-        .into_iter()
-        .map(|c| Cookie {
-            name: c.name,
-            value: c.value,
-            domain: Some(c.domain),
-            path: Some(c.path),
-            expires: Some(c.expires),
-            http_only: Some(c.http_only),
-            secure: Some(c.secure),
-            same_site: c.same_site.map(|s| format!("{s:?}")),
-        })
-        .collect();
+        chaser
+            .goto(url)
+            .await
+            .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
 
-    let user_agent = chaser
-        .evaluate("navigator.userAgent")
-        .await
-        .ok()
-        .and_then(|v| v?.as_str().map(str::to_owned))
-        .unwrap_or_default();
+        wait_for_clearance(&page, &chaser, 90).await;
 
-    let mut headers = HashMap::new();
-    headers.insert("user-agent".to_string(), user_agent);
+        let raw_cookies = page
+            .get_cookies()
+            .await
+            .map_err(|e| ChaserError::CookieExtractionFailed(e.to_string()))?;
 
-    Ok(WafSession::new(cookies, headers))
+        let cookies: Vec<Cookie> = raw_cookies
+            .into_iter()
+            .map(|c| Cookie {
+                name: c.name,
+                value: c.value,
+                domain: Some(c.domain),
+                path: Some(c.path),
+                expires: Some(c.expires),
+                http_only: Some(c.http_only),
+                secure: Some(c.secure),
+                same_site: c.same_site.map(|s| format!("{s:?}")),
+            })
+            .collect();
+
+        let user_agent = chaser
+            .evaluate("navigator.userAgent")
+            .await
+            .ok()
+            .and_then(|v| v?.as_str().map(str::to_owned))
+            .unwrap_or_default();
+
+        let mut headers = HashMap::new();
+        headers.insert("user-agent".to_string(), user_agent);
+
+        Ok(WafSession::new(cookies, headers))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(timeout_error()),
+    };
+
+    // Proxy contexts are isolated too, so dispose every context created for
+    // this operation. Preserve the solve result if cleanup alone fails.
+    if let Some(ctx_id) = ctx_id {
+        match tokio::time::timeout(Duration::from_secs(5), manager.dispose_context(ctx_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "failed to dispose WAF session browser context");
+            }
+            Err(_) => {
+                tracing::warn!("timed out disposing WAF session browser context");
+            }
+        }
+    }
+
+    result
 }
 
 /// Solve Turnstile with full page load.
@@ -94,7 +131,7 @@ pub async fn solve_turnstile_max(
     proxy: Option<ProxyConfig>,
 ) -> ChaserResult<String> {
     let _permit = manager.acquire_permit().await?;
-    let ctx_id = manager.create_context(proxy.as_ref()).await?;
+    let ctx_id = manager.create_context(proxy.as_ref(), false).await?;
     let (page, chaser) = manager.new_page(ctx_id, "about:blank").await?;
 
     setup_proxy_auth(&page, proxy.as_ref()).await?;
@@ -123,7 +160,7 @@ pub async fn solve_turnstile_min(
     use futures::StreamExt;
 
     let _permit = manager.acquire_permit().await?;
-    let ctx_id = manager.create_context(proxy.as_ref()).await?;
+    let ctx_id = manager.create_context(proxy.as_ref(), false).await?;
     let (page, chaser) = manager.new_page(ctx_id, "about:blank").await?;
 
     setup_proxy_auth(&page, proxy.as_ref()).await?;
@@ -305,14 +342,10 @@ async fn try_click_challenge(chaser: &chaser_oxide::ChaserPage) {
         // P1, P2 are random control points that produce a natural arc.
         let p0x = tx + rng.random_range(-200.0..=-60.0_f64);
         let p0y = ty + rng.random_range(-120.0..=120.0_f64);
-        let p1x =
-            p0x + (tx - p0x) * rng.random_range(0.2..0.5_f64) + rng.random_range(-30.0..30.0);
-        let p1y =
-            p0y + (ty - p0y) * rng.random_range(0.1..0.4_f64) + rng.random_range(-40.0..40.0);
-        let p2x =
-            p0x + (tx - p0x) * rng.random_range(0.5..0.8_f64) + rng.random_range(-20.0..20.0);
-        let p2y =
-            p0y + (ty - p0y) * rng.random_range(0.5..0.9_f64) + rng.random_range(-20.0..20.0);
+        let p1x = p0x + (tx - p0x) * rng.random_range(0.2..0.5_f64) + rng.random_range(-30.0..30.0);
+        let p1y = p0y + (ty - p0y) * rng.random_range(0.1..0.4_f64) + rng.random_range(-40.0..40.0);
+        let p2x = p0x + (tx - p0x) * rng.random_range(0.5..0.8_f64) + rng.random_range(-20.0..20.0);
+        let p2y = p0y + (ty - p0y) * rng.random_range(0.5..0.9_f64) + rng.random_range(-20.0..20.0);
 
         let steps: u8 = rng.random_range(12..22);
         let mut points: Vec<(f64, f64, u64)> = Vec::with_capacity(steps as usize);

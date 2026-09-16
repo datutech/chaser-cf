@@ -66,4 +66,4 @@ pub mod ffi;
 // Re-export main types at crate root
 pub use core::{ChaserCF, ChaserConfig};
 pub use error::ChaserError;
-pub use models::{Cookie, Profile, ProxyConfig, WafSession};
+pub use models::{Cookie, Profile, ProxyConfig, WafSession, WafSessionOptions};
