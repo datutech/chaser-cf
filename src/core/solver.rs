@@ -265,8 +265,8 @@ async fn wait_for_clearance(
         // Only start DOM inspection / clicking after the passive window.
         if started.elapsed().as_millis() as u64 >= PASSIVE_WAIT_MS
             && last_click.elapsed().as_millis() as u64 >= CLICK_INTERVAL_MS
+            && try_click_challenge(chaser).await
         {
-            try_click_challenge(chaser).await;
             last_click = std::time::Instant::now();
         }
 
@@ -288,7 +288,7 @@ async fn has_clearance_cookie(page: &chaser_oxide::Page) -> bool {
 /// `element.shadowRoot` returns null for these, but CDP's `DOM.getDocument` with
 /// `pierce: true` exposes them as `node.shadow_roots` — identical to what the Python
 /// CF-Clearance-Scraper does with `parent.shadow_roots[0]`.
-async fn try_click_challenge(chaser: &chaser_oxide::ChaserPage) {
+async fn try_click_challenge(chaser: &chaser_oxide::ChaserPage) -> bool {
     use chaser_oxide::cdp::browser_protocol::dom::{GetBoxModelParams, GetDocumentParams};
 
     let page = chaser.raw_page();
@@ -301,32 +301,89 @@ async fn try_click_challenge(chaser: &chaser_oxide::ChaserPage) {
         .await
     {
         Ok(r) => r,
-        Err(_) => return,
+        Err(error) => {
+            tracing::debug!(%error, "Turnstile DOM.getDocument failed");
+            return false;
+        }
     };
 
-    let Some(target_id) = find_shadow_challenge_node(&doc.result.root) else {
-        return;
+    let Some(target) = find_challenge_target(&doc.result.root) else {
+        tracing::debug!("Turnstile response input/iframe not found in pierced DOM");
+        return false;
     };
 
-    let box_model = match page
-        .execute(GetBoxModelParams {
-            node_id: Some(target_id),
+    // Prefer the actual checkbox when Chrome exposes the iframe's content
+    // document. If it is unavailable (for example for an OOPIF), use a point
+    // in the checkbox region near the left edge of the Turnstile iframe.
+    let (target_id, click_mode) = match target.checkbox_node_id {
+        Some(checkbox_id) => (checkbox_id, ChallengeClickMode::ElementCenter),
+        None => (
+            target.iframe_node_id,
+            ChallengeClickMode::IframeCheckboxRegion,
+        ),
+    };
+
+    let load_quad = |node_id| async move {
+        page.execute(GetBoxModelParams {
+            node_id: Some(node_id),
             backend_node_id: None,
             object_id: None,
         })
         .await
-    {
-        Ok(r) => r,
-        Err(_) => return,
+        .map(|result| result.result.model.content.inner().clone())
     };
 
-    let content = box_model.result.model.content.inner();
+    let (content, click_mode) = match load_quad(target_id).await {
+        Ok(content) => (content, click_mode),
+        Err(error) if target.checkbox_node_id.is_some() => {
+            tracing::debug!(%error, "Turnstile checkbox box model unavailable; using iframe fallback");
+            match load_quad(target.iframe_node_id).await {
+                Ok(content) => (content, ChallengeClickMode::IframeCheckboxRegion),
+                Err(error) => {
+                    tracing::debug!(%error, "Turnstile iframe box model unavailable");
+                    return false;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "Turnstile iframe box model unavailable");
+            return false;
+        }
+    };
+
     if content.len() < 8 {
-        return;
+        tracing::debug!(
+            points = content.len(),
+            "Turnstile box model has an invalid content quad"
+        );
+        return false;
     }
 
-    let cx = (content[0] + content[2]) / 2.0;
-    let cy = (content[1] + content[5]) / 2.0;
+    let left_x = (content[0] + content[6]) / 2.0;
+    let left_y = (content[1] + content[7]) / 2.0;
+    let right_x = (content[2] + content[4]) / 2.0;
+    let right_y = (content[3] + content[5]) / 2.0;
+    let width = ((right_x - left_x).powi(2) + (right_y - left_y).powi(2)).sqrt();
+    let height = ((content[6] - content[0]).powi(2) + (content[7] - content[1]).powi(2)).sqrt();
+
+    if width < 2.0 || height < 2.0 {
+        tracing::debug!(width, height, "Turnstile target has no clickable area");
+        return false;
+    }
+
+    let (cx, cy) = match click_mode {
+        ChallengeClickMode::ElementCenter => (
+            (content[0] + content[2] + content[4] + content[6]) / 4.0,
+            (content[1] + content[3] + content[5] + content[7]) / 4.0,
+        ),
+        ChallengeClickMode::IframeCheckboxRegion => {
+            const CHECKBOX_HORIZONTAL_POSITION: f64 = 0.10;
+            (
+                left_x + (right_x - left_x) * CHECKBOX_HORIZONTAL_POSITION,
+                left_y + (right_y - left_y) * CHECKBOX_HORIZONTAL_POSITION,
+            )
+        }
+    };
 
     // Compute all random values in a synchronous block so ThreadRng is dropped
     // before any await point — ThreadRng is !Send and would poison the future.
@@ -369,69 +426,180 @@ async fn try_click_challenge(chaser: &chaser_oxide::ChaserPage) {
     };
 
     for (bx, by, step_ms) in curve_points {
-        let _ = page
+        if let Err(error) = page
             .move_mouse(chaser_oxide::layout::Point::new(bx, by))
-            .await;
+            .await
+        {
+            tracing::debug!(%error, "Turnstile mouse movement failed");
+            return false;
+        }
         tokio::time::sleep(Duration::from_millis(step_ms)).await;
     }
 
     tokio::time::sleep(Duration::from_millis(post_pause_ms)).await;
-    let _ = page.click(chaser_oxide::layout::Point::new(tx, ty)).await;
+    if let Err(error) = page.click(chaser_oxide::layout::Point::new(tx, ty)).await {
+        tracing::debug!(%error, "Turnstile click failed");
+        return false;
+    }
+
+    tracing::debug!(x = tx, y = ty, ?click_mode, "clicked Turnstile challenge");
+    true
 }
 
-/// Walk the CDP DOM tree and return the NodeId to click for the Turnstile challenge.
-///
-/// Strategy (per Cloudflare's actual DOM layout):
-///   1. Find the node whose DIRECT children include `<input name="cf-turnstile-response">`.
-///   2. That node is the shadow host — check its `shadow_roots[0]` (CLOSED shadow root,
-///      invisible to JS but exposed by CDP's `pierce: true`).
-///   3. Return the first child of the shadow root that is NOT `display:none` — that is
-///      the visible challenge element whose centre we click.
-fn find_shadow_challenge_node(
+#[derive(Debug, Clone, Copy)]
+enum ChallengeClickMode {
+    ElementCenter,
+    IframeCheckboxRegion,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChallengeTarget {
+    iframe_node_id: chaser_oxide::cdp::browser_protocol::dom::NodeId,
+    checkbox_node_id: Option<chaser_oxide::cdp::browser_protocol::dom::NodeId>,
+}
+
+/// Locate the Turnstile iframe associated with a response input. Cloudflare's
+/// current layout places the hidden input next to (not inside) the closed
+/// shadow host. When CDP exposes the iframe document, prefer its real checkbox.
+fn find_challenge_target(
     node: &chaser_oxide::cdp::browser_protocol::dom::Node,
-) -> Option<chaser_oxide::cdp::browser_protocol::dom::NodeId> {
+) -> Option<ChallengeTarget> {
     let children = node.children.as_deref().unwrap_or(&[]);
 
-    // Is this node the shadow host? (has a cf-turnstile-response input as a direct child)
-    let is_shadow_host = children.iter().any(|child| {
-        child
-            .attributes
-            .as_deref()
-            .unwrap_or(&[])
-            .chunks(2)
-            .any(|p| p.len() == 2 && p[0] == "name" && p[1] == "cf-turnstile-response")
-    });
-
-    if is_shadow_host {
-        if let Some(sr) = node.shadow_roots.as_ref().and_then(|srs| srs.first()) {
-            for sr_child in sr.children.as_deref().unwrap_or(&[]) {
-                let hidden = sr_child
-                    .attributes
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .chunks(2)
-                    .any(|p| p.len() == 2 && p[0] == "style" && p[1].contains("display: none"));
-                if !hidden {
-                    return Some(sr_child.node_id);
+    if children.iter().any(is_turnstile_response_input) {
+        for sibling in children {
+            if !is_turnstile_response_input(sibling) {
+                if let Some(iframe) = find_turnstile_iframe(sibling) {
+                    return Some(target_from_iframe(iframe));
                 }
             }
         }
     }
 
-    // Recurse into children and shadow roots
+    // Retain a global iframe fallback for layouts where the response input is
+    // inserted later than the widget or is not a sibling of the shadow host.
+    if is_turnstile_iframe(node) {
+        return Some(target_from_iframe(node));
+    }
+
     for child in children {
-        if let Some(id) = find_shadow_challenge_node(child) {
-            return Some(id);
+        if let Some(target) = find_challenge_target(child) {
+            return Some(target);
         }
     }
     for sr in node.shadow_roots.as_deref().unwrap_or(&[]) {
-        for sr_child in sr.children.as_deref().unwrap_or(&[]) {
-            if let Some(id) = find_shadow_challenge_node(sr_child) {
-                return Some(id);
-            }
+        if let Some(target) = find_challenge_target(sr) {
+            return Some(target);
+        }
+    }
+    if let Some(document) = node.content_document.as_deref() {
+        if let Some(target) = find_challenge_target(document) {
+            return Some(target);
+        }
+    }
+    if let Some(template) = node.template_content.as_deref() {
+        if let Some(target) = find_challenge_target(template) {
+            return Some(target);
         }
     }
     None
+}
+
+fn target_from_iframe(iframe: &chaser_oxide::cdp::browser_protocol::dom::Node) -> ChallengeTarget {
+    // Depending on the Chrome/CDP version, the frame document may be exposed
+    // through `content_document` or as a child of the iframe owner node.
+    let checkbox_node_id = find_checkbox_node(iframe);
+
+    ChallengeTarget {
+        iframe_node_id: iframe.node_id,
+        checkbox_node_id,
+    }
+}
+
+fn find_turnstile_iframe(
+    node: &chaser_oxide::cdp::browser_protocol::dom::Node,
+) -> Option<&chaser_oxide::cdp::browser_protocol::dom::Node> {
+    if is_turnstile_iframe(node) {
+        return Some(node);
+    }
+
+    for child in node.children.as_deref().unwrap_or(&[]) {
+        if let Some(iframe) = find_turnstile_iframe(child) {
+            return Some(iframe);
+        }
+    }
+    for root in node.shadow_roots.as_deref().unwrap_or(&[]) {
+        if let Some(iframe) = find_turnstile_iframe(root) {
+            return Some(iframe);
+        }
+    }
+    if let Some(document) = node.content_document.as_deref() {
+        if let Some(iframe) = find_turnstile_iframe(document) {
+            return Some(iframe);
+        }
+    }
+    if let Some(template) = node.template_content.as_deref() {
+        if let Some(iframe) = find_turnstile_iframe(template) {
+            return Some(iframe);
+        }
+    }
+    None
+}
+
+fn find_checkbox_node(
+    node: &chaser_oxide::cdp::browser_protocol::dom::Node,
+) -> Option<chaser_oxide::cdp::browser_protocol::dom::NodeId> {
+    if attribute(node, "role").is_some_and(|value| value.eq_ignore_ascii_case("checkbox"))
+        || (node.node_name.eq_ignore_ascii_case("input")
+            && attribute(node, "type").is_some_and(|value| value.eq_ignore_ascii_case("checkbox")))
+    {
+        return Some(node.node_id);
+    }
+
+    for child in node.children.as_deref().unwrap_or(&[]) {
+        if let Some(node_id) = find_checkbox_node(child) {
+            return Some(node_id);
+        }
+    }
+    for root in node.shadow_roots.as_deref().unwrap_or(&[]) {
+        if let Some(node_id) = find_checkbox_node(root) {
+            return Some(node_id);
+        }
+    }
+    if let Some(document) = node.content_document.as_deref() {
+        if let Some(node_id) = find_checkbox_node(document) {
+            return Some(node_id);
+        }
+    }
+    None
+}
+
+fn is_turnstile_response_input(node: &chaser_oxide::cdp::browser_protocol::dom::Node) -> bool {
+    node.node_name.eq_ignore_ascii_case("input")
+        && attribute(node, "name") == Some("cf-turnstile-response")
+}
+
+fn is_turnstile_iframe(node: &chaser_oxide::cdp::browser_protocol::dom::Node) -> bool {
+    if !node.node_name.eq_ignore_ascii_case("iframe") {
+        return false;
+    }
+
+    attribute(node, "id").is_some_and(|id| id.starts_with("cf-chl-widget-"))
+        || attribute(node, "src").is_some_and(|src| {
+            src.contains("challenges.cloudflare.com") && src.contains("turnstile")
+        })
+}
+
+fn attribute<'a>(
+    node: &'a chaser_oxide::cdp::browser_protocol::dom::Node,
+    name: &str,
+) -> Option<&'a str> {
+    node.attributes
+        .as_deref()
+        .unwrap_or(&[])
+        .chunks_exact(2)
+        .find(|pair| pair[0].eq_ignore_ascii_case(name))
+        .map(|pair| pair[1].as_str())
 }
 
 const TURNSTILE_EXTRACTOR_SCRIPT: &str = r#"
@@ -487,5 +655,112 @@ async fn wait_for_turnstile_token(
         }
 
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_challenge_target;
+    use chaser_oxide::cdp::browser_protocol::dom::{BackendNodeId, Node, NodeId};
+
+    fn node(id: i64, name: &str, attributes: &[&str]) -> Node {
+        Node::builder()
+            .node_id(NodeId::new(id))
+            .backend_node_id(BackendNodeId::new(id))
+            .node_type(1)
+            .node_name(name)
+            .local_name(name.to_ascii_lowercase())
+            .node_value("")
+            .attributes(attributes.iter().copied())
+            .build()
+            .expect("valid test node")
+    }
+
+    fn dumped_challenge_tree(content_document: Option<Node>) -> Node {
+        let mut iframe = Node::builder()
+            .node_id(NodeId::new(4))
+            .backend_node_id(BackendNodeId::new(4))
+            .node_type(1)
+            .node_name("IFRAME")
+            .local_name("iframe")
+            .node_value("")
+            .attributes([
+                "id",
+                "cf-chl-widget-9uekg",
+                "src",
+                "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/widget",
+            ]);
+        if let Some(document) = content_document {
+            iframe = iframe.content_document(document);
+        }
+        let iframe = iframe.build().expect("valid iframe node");
+
+        let shadow_root = node(3, "#document-fragment", &[]);
+        let shadow_root = Node::builder()
+            .node_id(shadow_root.node_id)
+            .backend_node_id(shadow_root.backend_node_id)
+            .node_type(shadow_root.node_type)
+            .node_name(shadow_root.node_name)
+            .local_name(shadow_root.local_name)
+            .node_value(shadow_root.node_value)
+            .children(iframe)
+            .build()
+            .expect("valid shadow root");
+
+        let shadow_host = Node::builder()
+            .node_id(NodeId::new(2))
+            .backend_node_id(BackendNodeId::new(2))
+            .node_type(1)
+            .node_name("DIV")
+            .local_name("div")
+            .node_value("")
+            .shadow_root(shadow_root)
+            .build()
+            .expect("valid shadow host");
+        let response = node(
+            5,
+            "INPUT",
+            &["type", "hidden", "name", "cf-turnstile-response"],
+        );
+
+        Node::builder()
+            .node_id(NodeId::new(1))
+            .backend_node_id(BackendNodeId::new(1))
+            .node_type(1)
+            .node_name("DIV")
+            .local_name("div")
+            .node_value("")
+            .childrens([shadow_host, response])
+            .build()
+            .expect("valid response container")
+    }
+
+    #[test]
+    fn locates_iframe_when_response_input_is_its_shadow_host_sibling() {
+        let tree = dumped_challenge_tree(None);
+        let target = find_challenge_target(&tree).expect("challenge target");
+
+        assert_eq!(*target.iframe_node_id.inner(), 4);
+        assert!(target.checkbox_node_id.is_none());
+    }
+
+    #[test]
+    fn prefers_checkbox_inside_iframe_content_document() {
+        let checkbox = node(7, "INPUT", &["type", "checkbox"]);
+        let document = Node::builder()
+            .node_id(NodeId::new(6))
+            .backend_node_id(BackendNodeId::new(6))
+            .node_type(9)
+            .node_name("#document")
+            .local_name("")
+            .node_value("")
+            .children(checkbox)
+            .build()
+            .expect("valid frame document");
+        let tree = dumped_challenge_tree(Some(document));
+        let target = find_challenge_target(&tree).expect("challenge target");
+
+        assert_eq!(*target.iframe_node_id.inner(), 4);
+        assert_eq!(target.checkbox_node_id.map(|id| *id.inner()), Some(7));
     }
 }

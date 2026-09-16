@@ -2,3 +2,5 @@
 Cargo.lock
 .env
 *.log
+/dev_temp
+.DS_Store
